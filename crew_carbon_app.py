@@ -7,16 +7,33 @@ from __future__ import annotations
 
 from datetime import date
 from io import BytesIO
+from pathlib import Path
 
 import streamlit as st
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
-    HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+    HRFlowable, Image as RLImage, Paragraph,
+    SimpleDocTemplate, Spacer, Table, TableStyle,
 )
+
+# ── Register CREW brand fonts ─────────────────────────────────────────────────
+_HERE = Path(__file__).parent
+for _name, _file in [
+    ("FunnelSans",          "FunnelSans-regular.ttf"),
+    ("FunnelSans-Bold",     "FunnelSans-bold.ttf"),
+    ("FunnelSans-Italic",   "FunnelSans-italic.ttf"),
+    ("IBMPlexSans",         "IBMPlexSans-regular.ttf"),
+    ("IBMPlexSans-Bold",    "IBMPlexSans-bold.ttf"),
+    ("IBMPlexSans-Italic",  "IBMPlexSans-italic.ttf"),
+]:
+    _path = _HERE / _file
+    if _path.exists():
+        pdfmetrics.registerFont(TTFont(_name, str(_path)))
 
 from crew_intake_engine import (
     Confidence,
@@ -157,6 +174,15 @@ with st.sidebar:
                                     int(MIN_RESIDUAL_ALK), 100, int(TARGET_RESIDUAL_ALK), 5,
                                     help="Safety buffer to protect nitrifying bacteria from pH swings.")
 
+    st.divider()
+    st.caption("**Report options**")
+    client_logo_file = st.file_uploader(
+        "Client / utility logo (optional)",
+        type=["png", "jpg", "jpeg"],
+        help="Upload the facility or operator logo to include on the PDF report.",
+    )
+    client_logo_bytes: bytes | None = client_logo_file.read() if client_logo_file else None
+
 
 # ── Run engine ────────────────────────────────────────────────────────────────
 
@@ -253,188 +279,301 @@ st.divider()
 
 # ── PDF builder ───────────────────────────────────────────────────────────────
 
+# Brand palette (extracted from CREW identity)
+_NAVY   = colors.HexColor("#1B3548")
+_CORAL  = colors.HexColor("#FF6969")
+_LNAVY  = colors.HexColor("#EBF0F4")   # light navy tint for alt rows
+_WHITE  = colors.white
+_LGRAY  = colors.HexColor("#DEE2E6")
+_MGRAY  = colors.HexColor("#6C757D")
+_GREEN  = colors.HexColor("#2DC653")
+_AMBER  = colors.HexColor("#D97706")
+
+# Font names (registered at module load; fall back to Helvetica if TTF absent)
+_FB     = "FunnelSans-Bold"  if (_HERE / "FunnelSans-bold.ttf").exists()    else "Helvetica-Bold"
+_B      = "IBMPlexSans"      if (_HERE / "IBMPlexSans-regular.ttf").exists() else "Helvetica"
+_BB     = "IBMPlexSans-Bold" if (_HERE / "IBMPlexSans-bold.ttf").exists()   else "Helvetica-Bold"
+
+_LOGO_PATH = str(_HERE / "crew_logo.png")
+
+
+def _logo_image(path_or_bytes, max_w: float, max_h: float) -> RLImage | None:
+    """Return a scaled RLImage, or None if the source is unavailable."""
+    try:
+        src = BytesIO(path_or_bytes) if isinstance(path_or_bytes, bytes) else path_or_bytes
+        img = RLImage(src)
+        w, h = img.imageWidth, img.imageHeight
+        scale = min(max_w / w, max_h / h)
+        img.drawWidth, img.drawHeight = w * scale, h * scale
+        return img
+    except Exception:
+        return None
+
+
 def _alt_rows(n: int, c1: object, c2: object) -> list:
     return [("BACKGROUND", (0, i), (-1, i), c1 if i % 2 == 1 else c2)
             for i in range(1, n + 1)]
 
 
-def build_pdf(fname: str, inp: FacilityInputs, r) -> bytes:
-    buf  = BytesIO()
+def _section_bar(label: str, uw: float) -> Table:
+    """Full-width navy label bar used as a section header."""
+    t = Table([[label]], colWidths=[uw])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), _NAVY),
+        ("TEXTCOLOR",     (0, 0), (-1, -1), _WHITE),
+        ("FONTNAME",      (0, 0), (-1, -1), _FB),
+        ("FONTSIZE",      (0, 0), (-1, -1), 8),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+    ]))
+    return t
+
+
+def build_pdf(
+    fname: str,
+    inp: FacilityInputs,
+    r,
+    client_logo_bytes: bytes | None = None,
+) -> bytes:
+    buf = BytesIO()
     W, _ = letter
-    mg   = 0.75 * inch
-    uw   = W - 2 * mg
+    mg = 0.65 * inch
+    uw = W - 2 * mg
 
-    doc = SimpleDocTemplate(buf, pagesize=letter,
-                            topMargin=0.6*inch, bottomMargin=0.6*inch,
-                            leftMargin=mg, rightMargin=mg)
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        topMargin=0.5 * inch, bottomMargin=0.75 * inch,
+        leftMargin=mg, rightMargin=mg,
+    )
 
-    BLUE  = colors.HexColor("#0077B6")
-    LB    = colors.HexColor("#E8F4FD")
-    GRAY  = colors.HexColor("#6C757D")
-    LGRAY = colors.HexColor("#DEE2E6")
-    GREEN = colors.HexColor("#2DC653")
-    AMBER = colors.HexColor("#D97706")
+    # Canvas callback: draws coral rule + footer text pinned to page bottom
+    _today = date.today().strftime("%B %d, %Y")
+    def _draw_footer(canvas, _):
+        canvas.saveState()
+        y_rule = 0.55 * inch
+        canvas.setStrokeColor(_CORAL)
+        canvas.setLineWidth(3)
+        canvas.line(mg, y_rule, mg + uw, y_rule)
+        canvas.setFont(_B, 7)
+        canvas.setFillColor(_MGRAY)
+        canvas.drawCentredString(
+            W / 2, 0.35 * inch,
+            f"crewcarbon.com  ·  Prepared {_today}  ·  "
+            "Preliminary estimate based on stoichiometric mass balance and empirical data. "
+            "Site-specific sampling recommended before implementation.",
+        )
+        canvas.restoreState()
 
-    base  = getSampleStyleSheet()
-    T     = lambda name, **kw: ParagraphStyle(name, parent=base["Normal"], **kw)
+    base = getSampleStyleSheet()
+    S = lambda name, **kw: ParagraphStyle(name, parent=base["Normal"], **kw)
 
-    title_s   = T("t",  fontName="Helvetica-Bold", fontSize=20, textColor=BLUE, spaceAfter=2)
-    sub_s     = T("s",  fontName="Helvetica",       fontSize=10, textColor=GRAY, spaceAfter=10)
-    sec_s     = T("sc", fontName="Helvetica-Bold",  fontSize=11, textColor=BLUE,
-                  spaceBefore=10, spaceAfter=5)
-    body_s    = T("b",  fontName="Helvetica",       fontSize=9)
-    caption_s = T("c",  fontName="Helvetica-Oblique", fontSize=7.5, textColor=GRAY, spaceAfter=6)
-    foot_s    = T("f",  fontName="Helvetica", fontSize=7, textColor=GRAY, alignment=TA_CENTER)
-
-    HCMDS = [
-        ("BACKGROUND", (0,0), (-1,0), BLUE),
-        ("TEXTCOLOR",  (0,0), (-1,0), colors.white),
-        ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE",   (0,0), (-1,0), 9),
-        ("ALIGN",      (0,0), (-1,0), "CENTER"),
-    ]
-    BASE = [
-        ("FONTSIZE",       (0,1), (-1,-1), 9),
-        ("TOPPADDING",     (0,0), (-1,-1), 5),
-        ("BOTTOMPADDING",  (0,0), (-1,-1), 5),
-        ("LEFTPADDING",    (0,0), (-1,-1), 6),
-        ("RIGHTPADDING",   (0,0), (-1,-1), 6),
-        ("VALIGN",         (0,0), (-1,-1), "MIDDLE"),
-        ("GRID",           (0,0), (-1,-1), 0.25, LGRAY),
-        ("BOX",            (0,0), (-1,-1), 1,    BLUE),
-    ]
-
+    body_s    = S("bd",  fontName=_B,  fontSize=8.5, leading=12, spaceAfter=4)
+    caption_s = S("cp",  fontName=_B,  fontSize=7.5, textColor=_MGRAY,
+                  leading=10, spaceAfter=3)
+    prep_lbl  = S("pl",  fontName=_FB, fontSize=7,   textColor=_CORAL,
+                  leading=9, spaceAfter=1)
+    prep_val  = S("pv",  fontName=_BB, fontSize=10,  textColor=_NAVY,
+                  leading=12)
     story = []
 
-    # Header
-    story.append(Paragraph("CREW", title_s))
+    # ── Header: CREW logo  |  spacer  |  client logo ─────────────────────────
+    crew_img   = _logo_image(_LOGO_PATH, max_w=1.4*inch, max_h=0.45*inch)
+    client_img = _logo_image(client_logo_bytes, max_w=1.6*inch, max_h=0.45*inch) \
+                 if client_logo_bytes else None
+
+    left_cell  = crew_img  or Paragraph("CREW", S("cl", fontName=_FB, fontSize=16, textColor=_NAVY))
+    right_cell = client_img or Paragraph("")
+
+    hdr_tbl = Table([[left_cell, Paragraph(""), right_cell]],
+                    colWidths=[1.6*inch, uw - 3.4*inch, 1.8*inch])
+    hdr_tbl.setStyle(TableStyle([
+        ("VALIGN",  (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN",   (2, 0), (2,  0),  "RIGHT"),
+    ]))
+    story.append(hdr_tbl)
+    story.append(Spacer(1, 4))
+
+    # coral rule
+    story.append(HRFlowable(width="100%", thickness=3, color=_CORAL, spaceAfter=8))
+
+    # ── Title block ───────────────────────────────────────────────────────────
     story.append(Paragraph(
-        f"Facility Evaluation &nbsp;·&nbsp; <b>{fname}</b> &nbsp;·&nbsp; "
-        f"{date.today().strftime('%B %d, %Y')}",
-        sub_s,
+        "Alkalinity-Enhanced Mode™ &nbsp;|&nbsp; Facility Evaluation",
+        S("ti", fontName=_FB, fontSize=14, textColor=_NAVY, spaceAfter=2),
     ))
-    story.append(HRFlowable(width="100%", thickness=2, color=BLUE, spaceAfter=10))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=_LGRAY, spaceAfter=8))
 
-    # Dose hero table
-    conf_color = GREEN if r.confidence == Confidence.HIGH else \
-                 BLUE  if r.confidence == Confidence.MEDIUM else \
-                 AMBER if r.confidence == Confidence.LOW else GRAY
+    # ── Prepared-for block ───────────────────────────────────────────────────
+    conf_color = _GREEN if r.confidence == Confidence.HIGH  else \
+                 _NAVY  if r.confidence == Confidence.MEDIUM else \
+                 _AMBER if r.confidence == Confidence.LOW    else _MGRAY
 
-    hero_data = [
-        ["Recommended GCC Dose",   "Tons / Day",                  "Cost / Day",                 "Cost / Year"],
-        [f"{r.dose_mgl:.0f} mg/L", f"{r.mass_mt_per_day:.2f} MT", f"${r.cost_per_day_usd:,.0f}", f"${r.cost_per_year_usd:,.0f}"],
-        [f"Range: {r.dose_range_mgl[0]:.0f}–{r.dose_range_mgl[1]:.0f} mg/L",
-         f"Plant flow: {inp.flow_mgd:.1f} MGD",
-         f"${inp.gcc_cost_per_mt:,.0f}/MT",
-         f"{r.mass_mt_per_day * 365:,.0f} MT/yr"],
-    ]
-    bw = uw / 4
-    ht = Table(hero_data, colWidths=[bw]*4, rowHeights=[16, 26, 12])
-    ht.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,0), BLUE),
-        ("TEXTCOLOR",     (0,0), (-1,0), colors.white),
-        ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE",      (0,0), (-1,0), 8),
-        ("BACKGROUND",    (0,1), (-1,1), LB),
-        ("TEXTCOLOR",     (0,1), (-1,1), BLUE),
-        ("FONTNAME",      (0,1), (-1,1), "Helvetica-Bold"),
-        ("FONTSIZE",      (0,1), (-1,1), 14),
-        ("BACKGROUND",    (0,2), (-1,2), colors.white),
-        ("TEXTCOLOR",     (0,2), (-1,2), GRAY),
-        ("FONTNAME",      (0,2), (-1,2), "Helvetica-Oblique"),
-        ("FONTSIZE",      (0,2), (-1,2), 7),
-        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING",    (0,0), (-1,-1), 4),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-        ("BOX",           (0,0), (-1,-1), 1.5, BLUE),
-        ("INNERGRID",     (0,0), (-1,-1), 0.5, LGRAY),
+    pf_data = [[
+        Paragraph("PREPARED FOR", prep_lbl),
+        Paragraph("PLANT FLOW",   prep_lbl),
+        Paragraph("DATE",         prep_lbl),
+        Paragraph("ESTIMATE QUALITY", prep_lbl),
+    ], [
+        Paragraph(fname or "—",              prep_val),
+        Paragraph(f"{inp.flow_mgd:.1f} MGD", prep_val),
+        Paragraph(date.today().strftime("%B %d, %Y"), prep_val),
+        Paragraph(r.confidence.value,        S("cv", fontName=_BB, fontSize=10,
+                                               textColor=conf_color, leading=12)),
+    ]]
+    pf_tbl = Table(pf_data, colWidths=[uw*0.32, uw*0.18, uw*0.26, uw*0.24])
+    pf_tbl.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LINEBELOW",     (0, 1), (-1, 1),  0.5, _LGRAY),
     ]))
-    story.append(ht)
-
-    # Confidence badge row
-    story.append(Spacer(1, 6))
-    badge_data = [[f"{r.confidence.value} Confidence  ·  {r.method}"]]
-    bt = Table(badge_data, colWidths=[uw])
-    bt.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,-1), conf_color),
-        ("TEXTCOLOR",     (0,0), (-1,-1), colors.white),
-        ("FONTNAME",      (0,0), (-1,-1), "Helvetica-Bold"),
-        ("FONTSIZE",      (0,0), (-1,-1), 8),
-        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
-        ("TOPPADDING",    (0,0), (-1,-1), 4),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-    ]))
-    story.append(bt)
+    story.append(pf_tbl)
     story.append(Spacer(1, 10))
 
-    # Explanation
-    story.append(Paragraph("Recommendation Basis", sec_s))
+    # ── Recommendation metrics ────────────────────────────────────────────────
+    story.append(_section_bar("RECOMMENDED ALKALINITY ADDITION", uw))
+    story.append(Spacer(1, 4))
+
+    met_data = [
+        ["GCC DOSE",              "TONS / DAY",                    "COST / DAY",                   "COST / YEAR"],
+        [f"{r.dose_mgl:.0f} mg/L", f"{r.mass_mt_per_day:.2f} MT", f"${r.cost_per_day_usd:,.0f}",  f"${r.cost_per_year_usd:,.0f}"],
+        [f"Range {r.dose_range_mgl[0]:.0f}–{r.dose_range_mgl[1]:.0f} mg/L",
+         f"{r.mass_mt_per_day * 365:,.0f} MT/yr",
+         f"@ ${inp.gcc_cost_per_mt:,.0f}/MT",
+         f"{r.confidence.value} confidence  ·  {r.data_score}% data"],
+    ]
+    bw = uw / 4
+    met_tbl = Table(met_data, colWidths=[bw]*4, rowHeights=[14, 28, 11])
+    met_tbl.setStyle(TableStyle([
+        # Label row
+        ("BACKGROUND",    (0, 0), (-1, 0), _LNAVY),
+        ("TEXTCOLOR",     (0, 0), (-1, 0), _NAVY),
+        ("FONTNAME",      (0, 0), (-1, 0), _FB),
+        ("FONTSIZE",      (0, 0), (-1, 0), 7),
+        ("ALIGN",         (0, 0), (-1, 0), "CENTER"),
+        # Value row
+        ("TEXTCOLOR",     (0, 1), (-1, 1), _NAVY),
+        ("FONTNAME",      (0, 1), (-1, 1), _FB),
+        ("FONTSIZE",      (0, 1), (-1, 1), 18),
+        # Coral accent on the dose cell
+        ("TEXTCOLOR",     (0, 1), (0,  1), _CORAL),
+        # Sub-caption row
+        ("TEXTCOLOR",     (0, 2), (-1, 2), _MGRAY),
+        ("FONTNAME",      (0, 2), (-1, 2), _B),
+        ("FONTSIZE",      (0, 2), (-1, 2), 7),
+        # All
+        ("ALIGN",         (0, 1), (-1, -1), "CENTER"),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("BOX",           (0, 0), (-1, -1), 1.5, _NAVY),
+        ("INNERGRID",     (0, 0), (-1, -1), 0.4, _LGRAY),
+        ("LINEBELOW",     (0, 0), (-1, 0),  1,   _NAVY),
+        ("LINEBELOW",     (0, 1), (-1, 1),  0.5, _LGRAY),
+    ]))
+    story.append(met_tbl)
+    story.append(Spacer(1, 10))
+
+    # ── Calculation basis ─────────────────────────────────────────────────────
+    story.append(_section_bar("HOW WE CALCULATED THIS", uw))
+    story.append(Spacer(1, 4))
     story.append(Paragraph(r.explanation, body_s))
+    story.append(Paragraph(
+        f"<i>Method: {r.method}</i>", caption_s
+    ))
     story.append(Spacer(1, 8))
 
-    # Inputs used
-    story.append(Paragraph("Facility Inputs", sec_s))
+    # ── Inputs provided ───────────────────────────────────────────────────────
+    def irow(label, val): return [label, val] if val is not None else None
 
-    def row(label, val): return [label, val if val is not None else "—"]
-    input_rows = [
-        ["Parameter", "Value"],
-        row("Flow",                  f"{inp.flow_mgd:.1f} MGD"),
-        row("GCC cost",              f"${inp.gcc_cost_per_mt:,.0f}/MT"),
-        row("Dissolution efficiency",f"{inp.dissolution_efficiency*100:.0f}%"),
-        row("Target residual alk.",  f"{inp.target_residual_alk_mgl:.0f} mg/L as CaCO₃"),
-        row("Influent NH₃-N",        f"{inp.influent_nh3_mgl:.1f} mg/L" if inp.influent_nh3_mgl else None),
-        row("Influent NO₂-N",        f"{inp.influent_no2_mgl:.1f} mg/L" if inp.influent_no2_mgl else None),
-        row("Influent NO₃-N",        f"{inp.influent_no3_mgl:.1f} mg/L" if inp.influent_no3_mgl else None),
-        row("Influent ortho-P",      f"{inp.influent_ortho_p_mgl:.1f} mg/L" if inp.influent_ortho_p_mgl else None),
-        row("Influent pH",           f"{inp.influent_ph:.1f}" if inp.influent_ph else None),
-        row("Influent alkalinity",   f"{inp.influent_alkalinity_mgl:.0f} mg/L as CaCO₃" if inp.influent_alkalinity_mgl else None),
-        row("Effluent NH₃-N limit",  f"{inp.target_nh3_mgl:.1f} mg/L" if inp.target_nh3_mgl else None),
-        row("Effluent NO₃-N limit",  f"{inp.target_no3_mgl:.1f} mg/L" if inp.target_no3_mgl else None),
-        row("TN limit",              f"{inp.target_tn_mgl:.1f} mg/L" if inp.target_tn_mgl else None),
-        row("TP limit",              f"{inp.target_tp_mgl:.1f} mg/L" if inp.target_tp_mgl else None),
-        row("Current SVI",           f"{inp.current_svi_ml_g:.0f} mL/g" if inp.current_svi_ml_g else None),
+    raw_rows = [
+        irow("Plant flow",            f"{inp.flow_mgd:.1f} MGD"),
+        irow("Influent alkalinity",   f"{inp.influent_alkalinity_mgl:.0f} mg/L as CaCO₃" if inp.influent_alkalinity_mgl else None),
+        irow("Influent pH",           f"{inp.influent_ph:.1f}" if inp.influent_ph else None),
+        irow("Influent NH₃-N",        f"{inp.influent_nh3_mgl:.1f} mg/L" if inp.influent_nh3_mgl else None),
+        irow("Influent NO₂-N",        f"{inp.influent_no2_mgl:.1f} mg/L" if inp.influent_no2_mgl else None),
+        irow("Influent NO₃-N",        f"{inp.influent_no3_mgl:.1f} mg/L" if inp.influent_no3_mgl else None),
+        irow("Influent ortho-P",      f"{inp.influent_ortho_p_mgl:.1f} mg/L" if inp.influent_ortho_p_mgl else None),
+        irow("Effluent NH₃-N limit",  f"{inp.target_nh3_mgl:.1f} mg/L" if inp.target_nh3_mgl else None),
+        irow("Effluent NO₃-N limit",  f"{inp.target_no3_mgl:.1f} mg/L" if inp.target_no3_mgl else None),
+        irow("Total nitrogen limit",  f"{inp.target_tn_mgl:.1f} mg/L" if inp.target_tn_mgl else None),
+        irow("Total phosphorus limit",f"{inp.target_tp_mgl:.1f} mg/L" if inp.target_tp_mgl else None),
+        irow("Current SVI",           f"{inp.current_svi_ml_g:.0f} mL/g" if inp.current_svi_ml_g else None),
+        irow("GCC product cost",      f"${inp.gcc_cost_per_mt:,.0f} / metric ton"),
+        irow("Dissolution efficiency",f"{inp.dissolution_efficiency*100:.0f}%"),
+        irow("Target residual alk.",  f"{inp.target_residual_alk_mgl:.0f} mg/L as CaCO₃"),
     ]
-    # Remove blank optional rows
-    input_rows = [input_rows[0]] + [r for r in input_rows[1:] if r[1] != "—"]
+    inp_rows = [ro for ro in raw_rows if ro is not None]
 
-    cw2 = [uw * 0.5, uw * 0.5]
-    it  = Table(input_rows, colWidths=cw2)
-    it.setStyle(TableStyle(
-        HCMDS + BASE + _alt_rows(len(input_rows) - 1, colors.white, LB)
-        + [("FONTNAME", (0,1), (0,-1), "Helvetica-Bold"),
-           ("TEXTCOLOR",(0,1), (0,-1), GRAY)]
-    ))
+    story.append(_section_bar("INPUTS PROVIDED", uw))
+    story.append(Spacer(1, 4))
+
+    # Use two-column layout only when there are enough rows to justify it
+    if len(inp_rows) > 5:
+        mid       = (len(inp_rows) + 1) // 2
+        left_col  = inp_rows[:mid]
+        right_col = inp_rows[mid:]
+        while len(right_col) < len(left_col):
+            right_col.append(["", ""])
+        combined = [[lc[0], lc[1], rc[0], rc[1]] for lc, rc in zip(left_col, right_col)]
+        it = Table(combined, colWidths=[uw*0.28, uw*0.22, uw*0.28, uw*0.22])
+        it.setStyle(TableStyle(
+            _alt_rows(len(combined), _WHITE, _LNAVY) + [
+                ("FONTNAME",      (0, 0), (-1, -1), _B),
+                ("FONTSIZE",      (0, 0), (-1, -1), 8),
+                ("FONTNAME",      (0, 0), (0, -1),  _BB),
+                ("FONTNAME",      (2, 0), (2, -1),  _BB),
+                ("TEXTCOLOR",     (0, 0), (0, -1),  _NAVY),
+                ("TEXTCOLOR",     (2, 0), (2, -1),  _NAVY),
+                ("TEXTCOLOR",     (1, 0), (1, -1),  _MGRAY),
+                ("TEXTCOLOR",     (3, 0), (3, -1),  _MGRAY),
+                ("TOPPADDING",    (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+                ("LINEAFTER",     (1, 0), (1, -1),  0.5, _LGRAY),
+                ("BOX",           (0, 0), (-1, -1), 0.5, _LGRAY),
+            ]
+        ))
+    else:
+        # Single-column layout for sparse data
+        it = Table(inp_rows, colWidths=[uw * 0.45, uw * 0.55])
+        it.setStyle(TableStyle(
+            _alt_rows(len(inp_rows), _WHITE, _LNAVY) + [
+                ("FONTNAME",      (0, 0), (-1, -1), _B),
+                ("FONTSIZE",      (0, 0), (-1, -1), 8),
+                ("FONTNAME",      (0, 0), (0, -1),  _BB),
+                ("TEXTCOLOR",     (0, 0), (0, -1),  _NAVY),
+                ("TEXTCOLOR",     (1, 0), (1, -1),  _MGRAY),
+                ("TOPPADDING",    (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+                ("BOX",           (0, 0), (-1, -1), 0.5, _LGRAY),
+            ]
+        ))
     story.append(it)
 
+    # ── Assumptions ───────────────────────────────────────────────────────────
     if r.assumptions:
         story.append(Spacer(1, 8))
-        story.append(Paragraph("Assumptions", sec_s))
+        story.append(_section_bar("ASSUMPTIONS", uw))
+        story.append(Spacer(1, 4))
         for a in r.assumptions:
             story.append(Paragraph(f"• {a}", caption_s))
 
-    story.append(Spacer(1, 14))
-    story.append(HRFlowable(width="100%", thickness=0.75, color=LGRAY, spaceAfter=6))
-    story.append(Paragraph(
-        f"Generated by CREW Facility Evaluation  ·  {date.today().strftime('%B %d, %Y')}  ·  "
-        "Results are estimates based on stoichiometric mass balance and empirical data. "
-        "Site-specific sampling is recommended before full-scale implementation.",
-        foot_s,
-    ))
-
-    doc.build(story)
+    doc.build(story, onFirstPage=_draw_footer, onLaterPages=_draw_footer)
     return buf.getvalue()
 
 
 # ── Download ──────────────────────────────────────────────────────────────────
 
-pdf  = build_pdf(fname, inputs, rec)
+pdf  = build_pdf(fname, inputs, rec, client_logo_bytes)
 safe = fname.replace(" ", "_")
 st.download_button(
-    label             = "📄 Download Summary Report",
-    data              = pdf,
-    file_name         = f"CREW_{safe}_{date.today()}.pdf",
-    mime              = "application/pdf",
-    type              = "primary",
+    label               = "📄 Download Summary Report",
+    data                = pdf,
+    file_name           = f"CREW_{safe}_{date.today()}.pdf",
+    mime                = "application/pdf",
+    type                = "primary",
     use_container_width = True,
 )
