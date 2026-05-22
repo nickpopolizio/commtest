@@ -47,10 +47,22 @@ st.set_page_config(
 st.markdown("""
 <style>
 [data-testid="stMetric"] {
-    background: #f0f7ff;
+    background: #ffffff;
     border-radius: 8px;
     padding: 1rem 1.2rem;
-    border-left: 3px solid #0077B6;
+    border-left: 4px solid #0077B6;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.10);
+}
+[data-testid="stMetricLabel"] p {
+    color: #6B7280 !important;
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.04em !important;
+}
+[data-testid="stMetricValue"] {
+    color: #0077B6 !important;
+    font-weight: 700 !important;
 }
 </style>
 """, unsafe_allow_html=True)
