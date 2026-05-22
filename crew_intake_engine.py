@@ -222,7 +222,7 @@ class IntakeRecommendationEngine:
                     f"With {inp.influent_nh3_mgl:.0f} mg/L incoming ammonia and a target of "
                     f"{inp.target_nh3_mgl or '~3'} mg/L, nitrification will consume approximately "
                     f"{nh3_removed * ALK_CONSUMED_PER_NH3:.0f} mg/L of alkalinity. "
-                    f"Your measured influent alkalinity of {influent_alk:.0f} mg/L as CaCO₃ "
+                    f"Measured influent alkalinity of {influent_alk:.0f} mg/L as CaCO₃ "
                     f"{'covers this demand — only a small maintenance dose is needed'if dose < 10 else 'is not sufficient on its own'}. "
                     f"A dose of {dose:.0f} mg/L GCC maintains a safe residual of {target_res:.0f} mg/L."
                 ),
@@ -244,11 +244,11 @@ class IntakeRecommendationEngine:
                 Confidence.MEDIUM,
                 "Alkalinity deficit calculation with estimated nitrogen demand",
                 (
-                    f"Starting from your measured alkalinity of {influent_alk:.0f} mg/L as CaCO₃, "
+                    f"Starting from the measured alkalinity of {influent_alk:.0f} mg/L as CaCO₃, "
                     f"the estimated nitrification demand of {net_alk_demand:.0f} mg/L "
                     f"{'leaves you with adequate headroom — a small dose maintains the safety buffer' if dose < 10 else 'creates a deficit that GCC needs to cover'}. "
                     f"A dose of {dose:.0f} mg/L GCC will maintain the {target_res:.0f} mg/L "
-                    f"target residual. Entering your effluent permit limits will refine this further."
+                    f"target residual. Entering the plant's effluent permit limits will refine this further."
                 ),
                 assumptions,
             )
@@ -269,7 +269,7 @@ class IntakeRecommendationEngine:
                 Confidence.LOW,
                 "pH-derived alkalinity estimate",
                 (
-                    f"Your pH of {inp.influent_ph:.1f} suggests an influent alkalinity of roughly "
+                    f"A pH of {inp.influent_ph:.1f} suggests an influent alkalinity of roughly "
                     f"{est_alk:.0f} mg/L as CaCO₃. Based on this and an estimated nitrification "
                     f"demand of {net_alk_demand:.0f} mg/L, a dose of {dose:.0f} mg/L is indicated. "
                     "We recommend measuring alkalinity directly — it takes 5 minutes on-site "
@@ -292,9 +292,9 @@ class IntakeRecommendationEngine:
                 Confidence.LOW,
                 "Permit-limit estimate using assumed influent quality",
                 (
-                    f"Using your effluent limits and typical municipal influent values, a starting "
+                    f"Using the plant's effluent limits and typical municipal influent values, a starting "
                     f"dose of {dose:.0f} mg/L is estimated. This could vary significantly depending "
-                    f"on your actual water quality. Entering your measured alkalinity is the single "
+                    f"on actual water quality. Entering the plant's measured alkalinity is the single "
                     "most impactful step to improve this recommendation."
                 ),
                 assumptions,
@@ -317,7 +317,7 @@ class IntakeRecommendationEngine:
                 Confidence.LOW,
                 "Empirical SVI-based estimate",
                 (
-                    f"Based on {'a current SVI of ' + str(int(svi)) + ' mL/g' if svi else 'your target SVI reduction'}, "
+                    f"Based on {'a current SVI of ' + str(int(svi)) + ' mL/g' if svi else 'a target SVI reduction'}, "
                     f"an empirical dose of {dose:.0f} mg/L is estimated from published settling "
                     "improvement data. This does not account for alkalinity balance. "
                     "Please provide alkalinity or pH readings for a more complete recommendation."
